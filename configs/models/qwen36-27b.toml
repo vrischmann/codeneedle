@@ -8,9 +8,9 @@
 # directly to qwen36-27b-mlx.
 
 name              = "qwen3.6-27b"
-base_url          = "http://localhost:1234"
+base_url          = "http://zeffo.local:1234"
 temperature       = 0.0
-max_tokens        = 1500
+max_tokens        = 15000
 timeout           = 600.0
 prefill_no_think  = true    # the only technique that reliably skips CoT on qwen3.6
 suppress_thinking = true    # appends /no_think; harmless when ignored

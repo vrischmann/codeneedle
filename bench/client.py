@@ -57,5 +57,15 @@ def chat_complete(cfg: ClientConfig, system: str | None, user: str) -> str:
         r = client.post(url, json=payload, headers=headers)
         if r.status_code >= 400:
             raise RuntimeError(f"HTTP {r.status_code}: {r.text[:500]}")
+
         data = r.json()
-    return data["choices"][0]["message"]["content"]
+
+    msg = data["choices"][0]["message"]
+    content = msg.get("content")
+    if content is None:
+        # vLLM reasoning models (Qwen3.x, DeepSeek-R1, …) put CoT tokens in
+        # a separate `reasoning` field and set `content` to null when the
+        # entire budget is spent on thinking. Fall back to reasoning so the
+        # caller gets *something* rather than None.
+        content = msg.get("reasoning") or ""
+    return content
