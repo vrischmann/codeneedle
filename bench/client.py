@@ -53,12 +53,22 @@ class ClientConfig:
     # reasoning models — see configs/CONFIG_README.md for the matrix. Combine
     # freely; harmless flags are just ignored by models that don't recognize them.
     reasoning_effort: str | None = None    # sends `reasoning_effort: <value>` in request body (e.g. "none", "low")
-    prefill_no_think: bool = False         # appends an assistant message containing `thinking...\n\n`
+    prefill_no_think: bool = False         # appends an assistant message containing `<think>\n</think>\n\n`
     stop: list[str] | None = None          # stop sequences sent to the server; useful for models that parrot the prompt back (Gemma 4)
     use_max_completion_tokens: bool = False  # send `max_completion_tokens` instead of `max_tokens` (required by OpenAI GPT-5 family)
+    extra_body: dict[str, Any] = field(default_factory=dict)  # extra fields merged into the request body (e.g. enable_thinking for vLLM)
 
 
-def chat_complete(cfg: ClientConfig, system: str | None, user: str) -> ChatResponse:
+@dataclass
+class DebugCapture:
+    """Full request/response capture for debug logging."""
+    request_url: str
+    request_payload: dict
+    response_status: int
+    response_data: dict
+
+
+def chat_complete(cfg: ClientConfig, system: str | None, user: str, *, debug: bool = False) -> tuple[ChatResponse, DebugCapture | None]:
     messages: list[dict] = []
     if system:
         messages.append({"role": "system", "content": system})
@@ -81,8 +91,8 @@ def chat_complete(cfg: ClientConfig, system: str | None, user: str) -> ChatRespo
         payload["max_tokens"] = cfg.max_tokens
     if cfg.reasoning_effort is not None:
         payload["reasoning_effort"] = cfg.reasoning_effort
-    if cfg.stop:
-        payload["stop"] = cfg.stop
+    if cfg.extra_body:
+        payload.update(cfg.extra_body)
 
     headers = {"Content-Type": "application/json"}
     if cfg.api_key:
@@ -94,6 +104,15 @@ def chat_complete(cfg: ClientConfig, system: str | None, user: str) -> ChatRespo
             raise RuntimeError(f"HTTP {r.status_code}: {r.text[:500]}")
 
         data = r.json()
+
+    debug_cap: DebugCapture | None = None
+    if debug:
+        debug_cap = DebugCapture(
+            request_url=url,
+            request_payload=payload,
+            response_status=r.status_code,
+            response_data=data,
+        )
 
     msg = data["choices"][0]["message"]
     content = msg.get("content")
@@ -119,4 +138,4 @@ def chat_complete(cfg: ClientConfig, system: str | None, user: str) -> ChatRespo
             completion_tokens=completion_tokens,
             timings=timings,
         ),
-    )
+    ), debug_cap

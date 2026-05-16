@@ -102,6 +102,18 @@ def _preflight_context_check(prompt: str, cfg: ClientConfig) -> str | None:
     """
     from dataclasses import replace
 
+    # vLLM NVFP4 chat template emits `<think>\n` (open) by default,
+    # which undoes the `prefill_no_think` technique. Pass enable_thinking=false
+    # inside `chat_template_kwargs` so the Jinja2 template sees it as a variable.
+    # Top-level `enable_thinking` is ignored; it must be in `chat_template_kwargs`.
+    if cfg.prefill_no_think and "enable_thinking" not in (
+        cfg.extra_body.get("chat_template_kwargs") or {}
+    ):
+        cfg.extra_body["chat_template_kwargs"] = {
+            **(cfg.extra_body.get("chat_template_kwargs") or {}),
+            "enable_thinking": False,
+        }
+
     probe_cfg = replace(cfg, max_tokens=16)
     try:
         chat_complete(probe_cfg, system=None, user=prompt)
@@ -126,6 +138,7 @@ def run_benchmark(
     skip_preflight: bool = False,
     fail_fast_after: int | None = 2,
     relax_indent: bool = False,
+    debug: bool = False,
 ) -> list[FunctionScore]:
     text = source.text
     total_lines = text.count("\n") + 1
@@ -189,6 +202,7 @@ def run_benchmark(
 
     scores: list[FunctionScore] = []
     runs: list[_Run] = []
+    debug_captures: list = []
     consecutive_errors = 0
     for i, t in enumerate(chosen, 1):
         prompt = _build_prompt(t, text, multi_file, suppress_thinking)
@@ -201,12 +215,19 @@ def run_benchmark(
         prompt_tokens = 0
         completion_tokens = 0
         timings = None
+        debug_cap = None
         try:
-            chat_resp = chat_complete(cfg, system=None, user=prompt)
+            chat_resp, debug_cap = chat_complete(cfg, system=None, user=prompt, debug=debug)
             resp = chat_resp.content
             prompt_tokens = chat_resp.usage.prompt_tokens
             completion_tokens = chat_resp.usage.completion_tokens
             timings = chat_resp.usage.timings or None
+            if debug and debug_cap:
+                resp_msg = debug_cap.response_data.get("choices", [{}])[0].get("message", {})
+                reasoning_chars = len(resp_msg.get("reasoning") or "")
+                content_chars = len(resp_msg.get("content") or "")
+                if reasoning_chars:
+                    print(f"    debug: reasoning={reasoning_chars} chars, content={content_chars} chars", flush=True)
         except Exception as e:
             request_error = str(e)
             print(f"  ERROR: {request_error}", flush=True)
@@ -251,6 +272,8 @@ def run_benchmark(
                 error=score_error,
             )
         )
+        if debug:
+            debug_captures.append(debug_cap)
         print(render_function(sc), flush=True)
 
         # Fail-fast: if N queries in a row error, the rest will too. Bail.
@@ -324,6 +347,27 @@ def run_benchmark(
         }
         dump_path.write_text(json.dumps(payload, indent=2))
         print(f"\nResults dumped to {dump_path}", flush=True)
+
+        # Debug dump: full request/response payloads for every query.
+        if debug:
+            debug_path = dump_path.with_suffix("").with_name(dump_path.stem + "__debug").with_suffix(".json")
+            debug_items = []
+            for i, (sc, r) in enumerate(zip(scores, runs)):
+                d = debug_captures[i] if i < len(debug_captures) else None
+                debug_items.append({
+                    "function": r.function,
+                    "request_url": d.request_url if d else None,
+                    "request": d.request_payload if d else None,
+                    "response_status": d.response_status if d else None,
+                    "response": d.response_data if d else None,
+                    "primary_matched": sc.primary_matched,
+                    "primary_total": sc.primary_total,
+                    "latency_s": r.latency_s,
+                    "prompt_chars": r.prompt_chars,
+                })
+            if debug_items:
+                debug_path.write_text(json.dumps(debug_items, indent=2))
+                print(f"Debug dump to {debug_path}", flush=True)
 
     return scores
 

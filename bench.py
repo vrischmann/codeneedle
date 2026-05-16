@@ -162,6 +162,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         skip_preflight=args.skip_preflight,
         fail_fast_after=None if args.no_fail_fast else args.fail_fast_after,
         relax_indent=relax_indent,
+        debug=args.debug,
     )
     passed = sum(1 for s in scores if s.passed)
     return 0 if passed == len(scores) else 1
@@ -284,6 +285,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument(
         "--strict-indent", action="store_true",
         help="enforce verbatim indentation (overrides model config to false)",
+    )
+    p_run.add_argument(
+        "--debug", action="store_true",
+        help="dump full request/response payloads to a *_debug.json file",
     )
     p_run.set_defaults(func=cmd_run)
 
