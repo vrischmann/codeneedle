@@ -124,6 +124,12 @@ def _legend_kwargs() -> dict:
     )
 
 
+def _avg_latency(results: list[dict]) -> float | None:
+    """Average latency in seconds across non-error results, or None if no data."""
+    lats = [r.get("latency_s") for r in results if r.get("latency_s") is not None and not r.get("error")]
+    return sum(lats) / len(lats) if lats else None
+
+
 def _chart_height(*, content_rows: int, n_legend_entries: int, base: int = 420) -> int:
     """Pick a height tall enough for both the data rows and the legend.
 
@@ -152,11 +158,13 @@ def leaderboard(runs: list[Run], colors: dict[str, str]):
         queries = len(r.data["results"])
         halluc = sum(x.get("hallucinated", 0) for x in r.data["results"])
         errored = sum(1 for x in r.data["results"] if x.get("error"))
+        avg_lat = _avg_latency(r.data["results"])
         rows.append({
             "model": r.model, "stem": r.path.stem,
             "matched": matched, "total": total,
             "passed": passed, "queries": queries,
             "halluc": halluc, "errored": errored,
+            "avg_latency": avg_lat,
         })
     rows.sort(key=lambda d: d["matched"], reverse=True)
 
@@ -167,12 +175,15 @@ def leaderboard(runs: list[Run], colors: dict[str, str]):
 
     fig = go.Figure()
     for row in rows:
+        lat_str = f" · {row['avg_latency']:.1f}s avg" if row['avg_latency'] is not None else ""
         annotation = (
             f"{row['matched']}/{row['total']} lines · "
             f"{row['passed']}/{row['queries']} pass · "
             f"{row['halluc']} halluc"
             + (f" · {row['errored']} err" if row['errored'] else "")
+            + lat_str
         )
+        hover_lat = f"<br>avg latency: {row['avg_latency']:.1f}s" if row['avg_latency'] is not None else ""
         hover = (
             f"<b>{row['model']}</b><br>"
             f"file: {row['stem']}<br>"
@@ -180,6 +191,7 @@ def leaderboard(runs: list[Run], colors: dict[str, str]):
             f"pass: {row['passed']} / {row['queries']}<br>"
             f"hallucinated: {row['halluc']}<br>"
             f"errored: {row['errored']}"
+            + hover_lat
         )
         fig.add_trace(go.Bar(
             x=[row["matched"]],
@@ -335,6 +347,190 @@ def recall_vs_depth(runs: list[Run], colors: dict[str, str], positions: dict[str
     return fig
 
 
+def response_time(runs: list[Run], colors: dict[str, str]):
+    """Grouped bars: per-function response latency (seconds) per model."""
+    import plotly.graph_objects as go
+
+    all_fns: set[str] = set()
+    for r in runs:
+        for x in r.data["results"]:
+            all_fns.add(x["function"])
+
+    # Sort functions by average latency across models (slowest first → top of chart)
+    def mean_latency(fn: str) -> float:
+        xs = []
+        for r in runs:
+            x = next((y for y in r.data["results"] if y["function"] == fn), None)
+            if x and x.get("latency_s") is not None and not x.get("error"):
+                xs.append(x["latency_s"])
+        return sum(xs) / len(xs) if xs else 0.0
+
+    fns = sorted(all_fns, key=mean_latency, reverse=True)
+    if not fns:
+        return None
+
+    fig = go.Figure()
+    max_lat = 0
+    for r in runs:
+        y = []
+        custom = []
+        for fn in fns:
+            x = next((z for z in r.data["results"] if z["function"] == fn), None)
+            if x is None or x.get("error") or x.get("latency_s") is None:
+                y.append(None)
+                custom.append("")
+            else:
+                lat = x["latency_s"]
+                y.append(round(lat, 2))
+                max_lat = max(max_lat, lat)
+                total = x.get("primary_total", 20)
+                matched = x.get("primary_matched", 0)
+                custom.append(f"matched {matched}/{total}")
+        fig.add_bar(
+            x=fns, y=y,
+            name=r.model,
+            legendgroup=r.model,
+            marker_color=colors[r.model],
+            customdata=custom,
+            hovertemplate=(
+                "<b>%{x}</b><br>"
+                "model: " + r.model + "<br>"
+                "run: " + r.path.stem + "<br>"
+                "latency: %{y:.1f}s<br>"
+                "%{customdata}<extra></extra>"
+            ),
+        )
+
+    fig.update_layout(
+        title="Response time per function (seconds)",
+        xaxis=dict(title="function (sorted by average latency, slowest → fastest)",
+                   tickangle=-40, automargin=True),
+        yaxis=dict(title="latency (seconds)", range=[0, max_lat * 1.15]),
+        barmode="group",
+        bargap=0.15,
+        bargroupgap=0.05,
+        height=_chart_height(content_rows=len(fns), n_legend_entries=len(runs)),
+        margin=dict(l=70, r=40, t=70, b=160),
+        legend=_legend_kwargs(),
+    )
+    return fig
+
+
+def speed_vs_quality(runs: list[Run], colors: dict[str, str]):
+    """Scatter: X = avg latency, Y = recall %. One marker per run. Pareto frontier overlay."""
+    import plotly.graph_objects as go
+
+    points = []
+    for r in runs:
+        results = r.data["results"]
+        non_err = [x for x in results if not x.get("error")]
+        if not non_err:
+            continue
+        total_matched = sum(x.get("primary_matched", 0) for x in non_err)
+        total_possible = sum(x.get("primary_total", 0) for x in non_err)
+        recall_pct = (total_matched / total_possible * 100) if total_possible else 0
+        lats = [x["latency_s"] for x in non_err if x.get("latency_s") is not None]
+        avg_lat = sum(lats) / len(lats) if lats else None
+        if avg_lat is None:
+            continue
+        passed = sum(1 for x in non_err if x.get("passed"))
+        queries = len(results)
+        halluc = sum(x.get("hallucinated", 0) for x in non_err)
+        points.append({
+            "model": r.model,
+            "stem": r.path.stem,
+            "avg_lat": avg_lat,
+            "recall_pct": recall_pct,
+            "matched": total_matched,
+            "total": total_possible,
+            "passed": passed,
+            "queries": queries,
+            "halluc": halluc,
+        })
+
+    if len(points) < 1:
+        return None
+
+    fig = go.Figure()
+
+    # Pareto frontier: points where nothing else is both faster (lower x) and more accurate (higher y).
+    # Standard approach: sort by x ascending, walk forward tracking max y so far.
+    sorted_pts = sorted(points, key=lambda p: (p["avg_lat"], -p["recall_pct"]))
+    frontier: list[dict] = []
+    best_recall_so_far = -1
+    for p in sorted_pts:
+        if p["recall_pct"] > best_recall_so_far:
+            frontier.append(p)
+            best_recall_so_far = p["recall_pct"]
+
+    # Plot Pareto frontier as a dashed line behind the scatter points.
+    if len(frontier) >= 2:
+        fig.add_trace(go.Scatter(
+            x=[p["avg_lat"] for p in frontier],
+            y=[p["recall_pct"] for p in frontier],
+            mode="lines",
+            name="Pareto frontier",
+            line=dict(dash="dash", width=2, color="#888"),
+            hoverinfo="skip",
+            showlegend=True,
+        ))
+
+    # One scatter trace per run (each toggleable from legend).
+    for p in points:
+        fig.add_trace(go.Scatter(
+            x=[p["avg_lat"]],
+            y=[p["recall_pct"]],
+            mode="markers+text",
+            name=p["stem"],
+            legendgroup=p["model"],
+            marker=dict(
+                size=14,
+                color=colors[p["model"]],
+                line=dict(color="#fff", width=2),
+            ),
+            text=[f"{p['recall_pct']:.0f}%"],
+            textposition="top center",
+            textfont=dict(size=11),
+            hovertext=[
+                f"<b>{p['stem']}</b><br>"
+                f"model: {p['model']}<br>"
+                f"recall: {p['matched']}/{p['total']} ({p['recall_pct']:.1f}%)<br>"
+                f"pass: {p['passed']}/{p['queries']}<br>"
+                f"hallucinated: {p['halluc']}<br>"
+                f"avg latency: {p['avg_lat']:.1f}s"
+            ],
+            hoverinfo="text",
+        ))
+
+    # Axis ranges with padding
+    x_vals = [p["avg_lat"] for p in points]
+    y_vals = [p["recall_pct"] for p in points]
+    x_min, x_max = min(x_vals), max(x_vals)
+    x_pad = max((x_max - x_min) * 0.1, 1)
+    y_min, y_max = min(y_vals), max(y_vals)
+    y_pad = max((y_max - y_min) * 0.1, 5)
+
+    # Pass threshold reference line
+    pass_pct = PASS_THRESHOLD / 20 * 100
+
+    fig.add_hline(
+        y=pass_pct, line_dash="dot", line_color="#aaa",
+        annotation_text=f"pass threshold ({pass_pct:.0f}%)",
+        annotation_position="bottom left",
+    )
+    fig.update_layout(
+        title="Speed vs. quality · top-left is best (fast + accurate)",
+        xaxis=dict(title="average response latency (seconds) →",
+                   range=[max(0, x_min - x_pad), x_max + x_pad]),
+        yaxis=dict(title="% primary lines matched ↑",
+                   range=[max(0, y_min - y_pad), min(105, y_max + y_pad)]),
+        height=_chart_height(content_rows=1, n_legend_entries=len(points) + 1, base=520),
+        margin=dict(l=70, r=40, t=70, b=70),
+        legend=_legend_kwargs(),
+    )
+    return fig
+
+
 # --- HTML assembly --------------------------------------------------------
 
 
@@ -378,6 +574,16 @@ CHART_PAGES = [
      "If recall falls off as x increases, the model is losing context as depth grows — the "
      "core finding for sliding-window models. Hover any marker for details.",
      "recall_vs_position"),
+    ("response-time", "Response time",
+     "Per-function response latency (seconds) for each model. Shorter bars mean faster responses. "
+     "Functions are sorted by average latency across models. Hover a bar for exact timing details.",
+     "response_time"),
+    ("speed-vs-quality", "Speed vs. quality",
+     "Each marker is one run, placed by its average response latency (x) and recall (y). "
+     "The Pareto frontier (dashed line) connects runs where nothing else is both faster and more accurate. "
+     "Points below the frontier are dominated — a better tradeoff exists. "
+     "Hover any marker for full details.",
+     "speed_vs_quality"),
 ]
 
 
@@ -419,6 +625,13 @@ def write_corpus_index(out_path: Path, group: str, runs: list[Run],
                        generated_pages: list[tuple[str, str]]) -> None:
     models = sorted({r.model for r in runs})
     queries = sum(len(r.data["results"]) for r in runs)
+    # Compute overall average latency across all runs
+    all_lats = []
+    for r in runs:
+        for x in r.data["results"]:
+            if x.get("latency_s") is not None and not x.get("error"):
+                all_lats.append(x["latency_s"])
+    avg_lat_str = f" · avg latency: {sum(all_lats)/len(all_lats):.1f}s" if all_lats else ""
     items = "".join(
         f'<li><a href="{slug}.html">{title}</a></li>'
         for slug, title in generated_pages
@@ -427,7 +640,7 @@ def write_corpus_index(out_path: Path, group: str, runs: list[Run],
         f'<div class="wrap">'
         f'<header><a href="../index.html">← all corpora</a></header>'
         f'<h1>{group}</h1>'
-        f'<p class="caption">{len(runs)} run(s) · {queries} queries · '
+        f'<p class="caption">{len(runs)} run(s) · {queries} queries{avg_lat_str} · '
         f'{len(models)} unique model(s): {", ".join(models)}</p>'
         f'<ul>{items}</ul>'
         f'</div>'
@@ -448,6 +661,8 @@ def write_dashboard(group: str, runs: list[Run], out_dir: Path) -> list[tuple[st
         "leaderboard": leaderboard(runs, colors),
         "per_function": per_function_bars(runs, colors),
         "recall_vs_position": recall_vs_depth(runs, colors, positions),
+        "response_time": response_time(runs, colors),
+        "speed_vs_quality": speed_vs_quality(runs, colors),
     }
 
     chart_dir = out_dir / group
