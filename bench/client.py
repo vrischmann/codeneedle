@@ -1,9 +1,44 @@
 """Minimal OpenAI-compatible chat-completions client."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 import httpx
+
+
+@dataclass
+class Usage:
+    """Token usage and server-side timing data returned by the API."""
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    # llama-server returns detailed timings in a top-level `timings` field.
+    timings: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def prompt_per_second(self) -> float | None:
+        """Prompt processing throughput (tokens/s), if reported by the server."""
+        v = self.timings.get("prompt_per_second")
+        return float(v) if v is not None else None
+
+    @property
+    def predicted_per_second(self) -> float | None:
+        """Generation throughput (tokens/s), if reported by the server."""
+        v = self.timings.get("predicted_per_second")
+        return float(v) if v is not None else None
+
+    @property
+    def cache_n(self) -> int | None:
+        """Number of prompt tokens reused from KV cache (llama-server only)."""
+        v = self.timings.get("cache_n")
+        return int(v) if v is not None else None
+
+
+@dataclass
+class ChatResponse:
+    """Response from chat_complete: content + usage metadata."""
+    content: str
+    usage: Usage = field(default_factory=Usage)
 
 
 @dataclass
@@ -18,12 +53,12 @@ class ClientConfig:
     # reasoning models — see configs/CONFIG_README.md for the matrix. Combine
     # freely; harmless flags are just ignored by models that don't recognize them.
     reasoning_effort: str | None = None    # sends `reasoning_effort: <value>` in request body (e.g. "none", "low")
-    prefill_no_think: bool = False         # appends an assistant message containing `<think>\n</think>\n\n`
+    prefill_no_think: bool = False         # appends an assistant message containing `thinking...\n\n`
     stop: list[str] | None = None          # stop sequences sent to the server; useful for models that parrot the prompt back (Gemma 4)
     use_max_completion_tokens: bool = False  # send `max_completion_tokens` instead of `max_tokens` (required by OpenAI GPT-5 family)
 
 
-def chat_complete(cfg: ClientConfig, system: str | None, user: str) -> str:
+def chat_complete(cfg: ClientConfig, system: str | None, user: str) -> ChatResponse:
     messages: list[dict] = []
     if system:
         messages.append({"role": "system", "content": system})
@@ -31,8 +66,8 @@ def chat_complete(cfg: ClientConfig, system: str | None, user: str) -> str:
     if cfg.prefill_no_think:
         # Pre-filling the assistant turn with an empty think block is the only
         # technique that reliably skips CoT on Qwen3.5/3.6 — the model sees
-        # </think> and continues from there with the actual answer.
-        messages.append({"role": "assistant", "content": "<think>\n</think>\n\n"})
+        # <think/> and continues from there with the actual answer.
+        messages.append({"role": "assistant", "content": "\n\n"})
 
     payload = {
         "model": cfg.model,
@@ -68,4 +103,20 @@ def chat_complete(cfg: ClientConfig, system: str | None, user: str) -> str:
         # entire budget is spent on thinking. Fall back to reasoning so the
         # caller gets *something* rather than None.
         content = msg.get("reasoning") or ""
-    return content
+
+    # Extract usage data (both servers return this).
+    raw_usage = data.get("usage") or {}
+    prompt_tokens = raw_usage.get("prompt_tokens", 0) or 0
+    completion_tokens = raw_usage.get("completion_tokens", 0) or 0
+
+    # llama-server returns a top-level `timings` object with detailed perf data.
+    timings: dict[str, Any] = data.get("timings") or {}
+
+    return ChatResponse(
+        content=content,
+        usage=Usage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            timings=timings,
+        ),
+    )

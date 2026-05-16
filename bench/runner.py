@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from .client import ClientConfig, chat_complete
+from .client import ChatResponse, ClientConfig, chat_complete
 from .extract import Source, extract, load_source_glob, stratified_sample
 from .report import render_function, render_summary
 from .scorer import FunctionScore, score
@@ -60,6 +60,9 @@ class _Run:
     prompt_chars: int
     response: str
     latency_s: float
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    timings: dict | None = None
     error: str | None = None
 
 
@@ -195,14 +198,29 @@ def run_benchmark(
         )
         start = time.monotonic()
         request_error: str | None = None
+        prompt_tokens = 0
+        completion_tokens = 0
+        timings = None
         try:
-            resp = chat_complete(cfg, system=None, user=prompt)
+            chat_resp = chat_complete(cfg, system=None, user=prompt)
+            resp = chat_resp.content
+            prompt_tokens = chat_resp.usage.prompt_tokens
+            completion_tokens = chat_resp.usage.completion_tokens
+            timings = chat_resp.usage.timings or None
         except Exception as e:
             request_error = str(e)
             print(f"  ERROR: {request_error}", flush=True)
             resp = ""
         latency = time.monotonic() - start
-        print(f"  response: {len(resp)} chars in {latency:.1f}s", flush=True)
+        tok_info = f"  ({prompt_tokens}+{completion_tokens} tok)" if prompt_tokens else ""
+        print(f"  response: {len(resp)} chars in {latency:.1f}s{tok_info}", flush=True)
+        if timings and timings.get("predicted_per_second"):
+            print(
+                f"    gen: {timings['predicted_per_second']:.0f} tok/s"
+                f"  prefill: {timings.get('prompt_per_second', 0):.0f} tok/s"
+                f"  cache: {timings.get('cache_n', 0)} tok",
+                flush=True,
+            )
 
         # Empty content with no exception = HTTP 200 but the model produced
         # nothing. On reasoning models that's typically the CoT eating the
@@ -227,6 +245,9 @@ def run_benchmark(
                 prompt_chars=len(prompt),
                 response=resp,
                 latency_s=latency,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                timings=timings,
                 error=score_error,
             )
         )
@@ -292,6 +313,9 @@ def run_benchmark(
                     "hallucinated": sc.hallucinated,
                     "bonus_matched": sc.bonus_matched,
                     "latency_s": r.latency_s,
+                    "prompt_tokens": r.prompt_tokens,
+                    "completion_tokens": r.completion_tokens,
+                    "timings": r.timings,
                     "prompt_chars": r.prompt_chars,
                     "response": r.response,
                 }

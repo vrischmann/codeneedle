@@ -130,6 +130,44 @@ def _avg_latency(results: list[dict]) -> float | None:
     return sum(lats) / len(lats) if lats else None
 
 
+def _throughput_stats(results: list[dict]) -> dict:
+    """Compute average generation throughput from available data.
+
+    Prefers server-reported `timings.predicted_per_second` (llama-server),
+    falls back to computing `completion_tokens / latency_s` (both servers).
+    Returns dict with keys: gen_tok_s, prompt_tok_s, avg_cache_n (all optional).
+    """
+    non_err = [r for r in results if not r.get("error")]
+    if not non_err:
+        return {}
+
+    gen_speeds = []
+    prompt_speeds = []
+    cache_ns = []
+    for r in non_err:
+        timings = r.get("timings") or {}
+        # Prefer server-reported speeds (more accurate).
+        if timings.get("predicted_per_second") is not None:
+            gen_speeds.append(float(timings["predicted_per_second"]))
+        elif r.get("completion_tokens") and r.get("latency_s"):
+            # Fallback: compute from token counts.
+            gen_speeds.append(r["completion_tokens"] / r["latency_s"])
+
+        if timings.get("prompt_per_second") is not None:
+            prompt_speeds.append(float(timings["prompt_per_second"]))
+        if timings.get("cache_n") is not None:
+            cache_ns.append(int(timings["cache_n"]))
+
+    out: dict = {}
+    if gen_speeds:
+        out["gen_tok_s"] = sum(gen_speeds) / len(gen_speeds)
+    if prompt_speeds:
+        out["prompt_tok_s"] = sum(prompt_speeds) / len(prompt_speeds)
+    if cache_ns:
+        out["avg_cache_n"] = sum(cache_ns) / len(cache_ns)
+    return out
+
+
 def _chart_height(*, content_rows: int, n_legend_entries: int, base: int = 420) -> int:
     """Pick a height tall enough for both the data rows and the legend.
 
@@ -159,12 +197,16 @@ def leaderboard(runs: list[Run], colors: dict[str, str]):
         halluc = sum(x.get("hallucinated", 0) for x in r.data["results"])
         errored = sum(1 for x in r.data["results"] if x.get("error"))
         avg_lat = _avg_latency(r.data["results"])
+        tp = _throughput_stats(r.data["results"])
         rows.append({
             "model": r.model, "stem": r.path.stem,
             "matched": matched, "total": total,
             "passed": passed, "queries": queries,
             "halluc": halluc, "errored": errored,
             "avg_latency": avg_lat,
+            "gen_tok_s": tp.get("gen_tok_s"),
+            "prompt_tok_s": tp.get("prompt_tok_s"),
+            "avg_cache_n": tp.get("avg_cache_n"),
         })
     rows.sort(key=lambda d: d["matched"], reverse=True)
 
@@ -176,14 +218,19 @@ def leaderboard(runs: list[Run], colors: dict[str, str]):
     fig = go.Figure()
     for row in rows:
         lat_str = f" · {row['avg_latency']:.1f}s avg" if row['avg_latency'] is not None else ""
+        gen_str = f" · {row['gen_tok_s']:.0f} tok/s gen" if row.get('gen_tok_s') is not None else ""
         annotation = (
             f"{row['matched']}/{row['total']} lines · "
             f"{row['passed']}/{row['queries']} pass · "
             f"{row['halluc']} halluc"
             + (f" · {row['errored']} err" if row['errored'] else "")
             + lat_str
+            + gen_str
         )
         hover_lat = f"<br>avg latency: {row['avg_latency']:.1f}s" if row['avg_latency'] is not None else ""
+        hover_gen = f"<br>gen throughput: {row['gen_tok_s']:.0f} tok/s" if row.get('gen_tok_s') is not None else ""
+        hover_prefill = f"<br>prefill: {row['prompt_tok_s']:.0f} tok/s" if row.get('prompt_tok_s') is not None else ""
+        hover_cache = f"<br>avg cache: {row['avg_cache_n']:.0f} tok" if row.get('avg_cache_n') is not None else ""
         hover = (
             f"<b>{row['model']}</b><br>"
             f"file: {row['stem']}<br>"
@@ -191,7 +238,7 @@ def leaderboard(runs: list[Run], colors: dict[str, str]):
             f"pass: {row['passed']} / {row['queries']}<br>"
             f"hallucinated: {row['halluc']}<br>"
             f"errored: {row['errored']}"
-            + hover_lat
+            + hover_lat + hover_gen + hover_prefill + hover_cache
         )
         fig.add_trace(go.Bar(
             x=[row["matched"]],
@@ -385,7 +432,15 @@ def response_time(runs: list[Run], colors: dict[str, str]):
                 max_lat = max(max_lat, lat)
                 total = x.get("primary_total", 20)
                 matched = x.get("primary_matched", 0)
-                custom.append(f"matched {matched}/{total}")
+                parts = [f"matched {matched}/{total}"]
+                timings = x.get("timings") or {}
+                if timings.get("predicted_per_second") is not None:
+                    parts.append(f"{timings['predicted_per_second']:.0f} gen tok/s")
+                if timings.get("prompt_per_second") is not None:
+                    parts.append(f"{timings['prompt_per_second']:.0f} prefill tok/s")
+                if timings.get("cache_n") is not None:
+                    parts.append(f"{timings['cache_n']} cached tok")
+                custom.append("<br>".join(parts))
         fig.add_bar(
             x=fns, y=y,
             name=r.model,
@@ -436,6 +491,11 @@ def speed_vs_quality(runs: list[Run], colors: dict[str, str]):
         passed = sum(1 for x in non_err if x.get("passed"))
         queries = len(results)
         halluc = sum(x.get("hallucinated", 0) for x in non_err)
+        # Throughput info
+        tp = _throughput_stats(results)
+        gen_tok_s = tp.get("gen_tok_s")
+        prompt_tok_s = tp.get("prompt_tok_s")
+        avg_cache_n = tp.get("avg_cache_n")
         points.append({
             "model": r.model,
             "stem": r.path.stem,
@@ -446,6 +506,9 @@ def speed_vs_quality(runs: list[Run], colors: dict[str, str]):
             "passed": passed,
             "queries": queries,
             "halluc": halluc,
+            "gen_tok_s": gen_tok_s,
+            "prompt_tok_s": prompt_tok_s,
+            "avg_cache_n": avg_cache_n,
         })
 
     if len(points) < 1:
@@ -488,7 +551,10 @@ def speed_vs_quality(runs: list[Run], colors: dict[str, str]):
                 color=colors[p["model"]],
                 line=dict(color="#fff", width=2),
             ),
-            text=[f"{p['recall_pct']:.0f}%"],
+            text=[
+                f"{p['recall_pct']:.0f}%"
+                + (f" · {p['gen_tok_s']:.0f} tok/s" if p.get('gen_tok_s') is not None else "")
+            ],
             textposition="top center",
             textfont=dict(size=11),
             hovertext=[
@@ -498,6 +564,9 @@ def speed_vs_quality(runs: list[Run], colors: dict[str, str]):
                 f"pass: {p['passed']}/{p['queries']}<br>"
                 f"hallucinated: {p['halluc']}<br>"
                 f"avg latency: {p['avg_lat']:.1f}s"
+                + (f"<br>gen: {p['gen_tok_s']:.0f} tok/s" if p.get('gen_tok_s') is not None else "")
+                + (f"<br>prefill: {p['prompt_tok_s']:.0f} tok/s" if p.get('prompt_tok_s') is not None else "")
+                + (f"<br>avg cache: {p['avg_cache_n']:.0f} tok" if p.get('avg_cache_n') is not None else "")
             ],
             hoverinfo="text",
         ))
