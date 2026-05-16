@@ -60,12 +60,15 @@ def _group_name(data: dict) -> str:
 def load_runs(results_dir: Path) -> dict[str, list[Run]]:
     groups: dict[str, list[Run]] = defaultdict(list)
     for p in sorted(results_dir.glob("*.json")):
+        if p.name.endswith("__debug.json"):
+            continue
+
         try:
             data = json.loads(p.read_text())
         except Exception as e:
             print(f"skip {p.name}: {e}", file=sys.stderr)
             continue
-        if not data.get("results"):
+        if isinstance(data, list) or not data.get("results"):
             continue
         group = _group_name(data)
         groups[group].append(Run(path=p, model=data.get("model", p.stem), group_name=group, data=data))
@@ -379,7 +382,7 @@ def recall_vs_depth(runs: list[Run], colors: dict[str, str], positions: dict[str
 
     fig.add_hline(
         y=PASS_THRESHOLD / 20 * 100, line_dash="dash", line_color="#888",
-        annotation_text=f"pass threshold ({PASS_THRESHOLD}/20 = {PASS_THRESHOLD/20*100:.0f}%)",
+        annotation_text=f"pass threshold ({PASS_THRESHOLD}/20 = {PASS_THRESHOLD / 20 * 100:.0f}%)",
         annotation_position="bottom right",
     )
     fig.update_layout(
@@ -700,7 +703,7 @@ def write_corpus_index(out_path: Path, group: str, runs: list[Run],
         for x in r.data["results"]:
             if x.get("latency_s") is not None and not x.get("error"):
                 all_lats.append(x["latency_s"])
-    avg_lat_str = f" · avg latency: {sum(all_lats)/len(all_lats):.1f}s" if all_lats else ""
+    avg_lat_str = f" · avg latency: {sum(all_lats) / len(all_lats):.1f}s" if all_lats else ""
     items = "".join(
         f'<li><a href="{slug}.html">{title}</a></li>'
         for slug, title in generated_pages
